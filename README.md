@@ -203,8 +203,7 @@ OCR_TIMEOUT = 30  # секунды на обработку одного файл
 
 Если у вас есть вопросы или проблемы:
 
-- Создайте [Issue](https://github.com/your-username/DocKitBot/issues)
-- Обратитесь к [документации](https://github.com/your-username/DocKitBot/wiki)
+- @HerrrMajor Telegram
 
 ---
 
