@@ -205,7 +205,7 @@ OCR_TIMEOUT = 30  # секунды на обработку одного файл
 
 - Создайте [Issue](https://github.com/Herrmajor01/DocKitBot/issues)
 - Обратитесь к [документации](https://github.com/Herrmajor01/DocKitBot/wiki)
-- @HerrrMajor Telegra
+- @HerrrMajor Telegram
 
 ---
 
