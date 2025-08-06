@@ -11,8 +11,8 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from config import Config
-from document_processor import DocumentProcessor
-from file_handler import FileHandler
+from DocKitBot.document_processor import DocumentProcessor
+from DocKitBot.file_handler import FileHandler
 
 
 class BotHandler:
@@ -109,7 +109,7 @@ class BotHandler:
 ⚠️ **Ограничения:**
 • Максимальный размер файла: 50MB
 • Общий размер архива: 100MB
-• Время обработки: до 30 секунд на файл
+• Время обработки: до 2 минут на файл
 
 🆘 **Если что-то пошло не так:**
 Бот сообщит об ошибках и предложит решения.
@@ -162,8 +162,15 @@ class BotHandler:
         def escape_markdown(text):
             return text.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
 
+        # Исправляем кодировку имен файлов для показа пользователю
+        def fix_display_name(file_path):
+            original_name = os.path.basename(file_path)
+            fixed_name = self.file_handler._fix_filename_encoding(
+                original_name)
+            return escape_markdown(fixed_name)
+
         files_list = "\n".join(
-            [f"• {escape_markdown(os.path.basename(f))}" for f in session['files']])
+            [f"• {fix_display_name(f)}" for f in session['files']])
         message_text = f"""
 📋 **Готов к обработке {len(session['files'])} документов:**
 
@@ -263,9 +270,14 @@ class BotHandler:
                 progress = int((i - 1) / total_files * 100)
                 progress_bar = self._create_progress_bar(progress)
 
+                # Исправляем имя файла для показа
+                display_name = self.file_handler._fix_filename_encoding(
+                    os.path.basename(file_path)
+                )
+
                 await progress_message.edit_text(
                     f"🔄 Обработка документов...\n\n"
-                    f"📄 Файл {i} из {total_files}: {os.path.basename(file_path)}\n"
+                    f"📄 Файл {i} из {total_files}: {display_name}\n"
                     f"⏳ Прогресс: {progress}%\n"
                     f"{progress_bar}"
                 )
@@ -277,13 +289,19 @@ class BotHandler:
                 if processed_file:
                     processed_files.append(processed_file)
                 else:
-                    errors.append(
-                        f"Не удалось обработать: {os.path.basename(file_path)}")
+                    # Исправляем имя файла для отчета об ошибке
+                    error_name = self.file_handler._fix_filename_encoding(
+                        os.path.basename(file_path)
+                    )
+                    errors.append(f"Не удалось обработать: {error_name}")
 
             except Exception as e:
                 logger.error(f"Ошибка обработки файла {file_path}: {e}")
-                errors.append(
-                    f"Ошибка обработки {os.path.basename(file_path)}: {str(e)}")
+                # Исправляем имя файла для отчета об ошибке
+                error_name = self.file_handler._fix_filename_encoding(
+                    os.path.basename(file_path)
+                )
+                errors.append(f"Ошибка обработки {error_name}: {str(e)}")
 
         if not processed_files:
             return {'success': False, 'error': 'Не удалось обработать ни одного файла'}
@@ -349,18 +367,42 @@ class BotHandler:
 
             # Если это ZIP архив, распаковываем его
             if file_ext == '.zip':
-                extracted_files = self.file_handler.extract_archive(
-                    file_path, user_id)
-                if extracted_files:
-                    session['files'].extend(extracted_files)
-                    files_count = len(extracted_files)
-                    logger.info(
-                        f"ZIP архив распакован: {files_count} файлов "
-                        f"добавлено в сессию пользователя {user_id}")
-                else:
-                    await update.message.reply_text(
-                        "⚠️ ZIP архив не содержит поддерживаемых файлов.\n"
-                        f"Поддерживаемые форматы: {', '.join(self.config.SUPPORTED_DOCUMENT_FORMATS)}"
+                # Показываем индикацию процесса распаковки
+                unpack_message = await update.message.reply_text(
+                    f"📦 Распаковываю архив {document.file_name}...\n"
+                    "⏳ Пожалуйста, подождите, это может занять некоторое время."
+                )
+
+                async def update_progress(progress, file_name):
+                    progress_bar = self._create_progress_bar(progress)
+                    await unpack_message.edit_text(
+                        f"📦 Распаковываю архив {document.file_name}...\n"
+                        f"📄 Файл: {os.path.basename(file_name)}\n"
+                        f"⏳ Прогресс: {progress}%\n"
+                        f"{progress_bar}"
+                    )
+
+                try:
+                    extracted_files = await self.file_handler.extract_archive(
+                        file_path, user_id, update_progress)
+
+                    if extracted_files:
+                        session['files'].extend(extracted_files)
+                        files_count = len(extracted_files)
+                        logger.info(
+                            f"ZIP архив распакован: {files_count} файлов "
+                            f"добавлено в сессию пользователя {user_id}")
+                    else:
+                        await unpack_message.edit_text(
+                            "⚠️ ZIP архив не содержит поддерживаемых файлов.\n"
+                            f"Поддерживаемые форматы: {', '.join(self.config.SUPPORTED_DOCUMENT_FORMATS)}"
+                        )
+                        return
+                except Exception as e:
+                    logger.error(f"Ошибка распаковки архива: {e}")
+                    await unpack_message.edit_text(
+                        f"❌ Ошибка при распаковке архива {document.file_name}.\n"
+                        "Проверьте, что архив не поврежден и содержит поддерживаемые файлы."
                     )
                     return
             else:
@@ -373,11 +415,13 @@ class BotHandler:
                 logger.info(
                     f"ZIP архив добавлен в сессию пользователя {user_id}: "
                     f"{document.file_name}, всего файлов: {total_files}")
-                status_message = (
+                # Финальное сообщение после распаковки
+                await unpack_message.edit_text(
                     f"✅ ZIP архив распакован: {document.file_name}\n"
                     f"📁 Всего файлов: {total_files}\n\n"
                     f"Отправьте еще файлы или используйте /process для обработки."
                 )
+                return  # Выходим, не отправляя дополнительное сообщение
             else:
                 total_files = len(session['files'])
                 logger.info(
@@ -389,24 +433,14 @@ class BotHandler:
                     f"Отправьте еще файлы или используйте /process для обработки."
                 )
 
-            # Всегда отправляем уведомление пользователю
+            # Для обычных файлов отправляем уведомление пользователю
             logger.info(
                 f"Подготовка к отправке статусного сообщения "
                 f"для пользователя {user_id}")
             try:
-                # Всегда отправляем новое сообщение для архивов
-                if file_ext == '.zip':
-                    logger.info(
-                        f"Отправляем новое сообщение для ZIP архива "
-                        f"пользователя {user_id}")
-                    message = await update.message.reply_text(status_message)
-                    session['last_message_id'] = message.message_id
-                    logger.info(
-                        f"Новое сообщение для ZIP архива отправлено "
-                        f"пользователю {user_id}")
                 # Для обычных файлов используем обновление сообщения
-                elif (len(session['files']) == 1 or
-                      not session.get('last_message_id')):
+                if (len(session['files']) == 1 or
+                        not session.get('last_message_id')):
                     logger.info(
                         f"Отправляем новое сообщение для пользователя {user_id}")
                     message = await update.message.reply_text(status_message)
@@ -484,7 +518,7 @@ class BotHandler:
             try:
                 # Если это первый файл в сессии, просто отправляем сообщение
                 if (len(session['files']) == 1 or
-                    not session.get('last_message_id')):
+                        not session.get('last_message_id')):
                     message = await update.message.reply_text(photo_status_message)
                     session['last_message_id'] = message.message_id
                 else:
@@ -525,13 +559,16 @@ class BotHandler:
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-            # Отправляем архив
+            # Отправляем архив с увеличенным таймаутом
             if result.get('archive_path'):
                 with open(result['archive_path'], 'rb') as archive:
                     await update.callback_query.message.reply_document(
                         document=archive,
-                        filename=f"обработанные_документы_{user_id}.zip",
-                        caption="✅ Обработка завершена! Вот ваш архив с документами."
+                        filename=f"обработанные_документы.zip",
+                        caption="✅ Обработка завершена! Вот ваш архив с документами.",
+                        read_timeout=60,
+                        write_timeout=60,
+                        connect_timeout=60
                     )
 
             # Отправляем отчет об ошибках

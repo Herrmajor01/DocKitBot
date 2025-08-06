@@ -11,8 +11,8 @@ from telegram import Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           MessageHandler, filters)
 
-from bot_handler import BotHandler
 from config import Config
+from DocKitBot.bot_handler import BotHandler
 
 # Загружаем переменные окружения
 load_dotenv()

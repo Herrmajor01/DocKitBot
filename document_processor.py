@@ -2,6 +2,7 @@
 Основной процессор документов для DocKitBot
 """
 
+import asyncio
 import os
 import re
 from collections import defaultdict
@@ -10,9 +11,9 @@ from typing import Any, Dict, List, Tuple
 from loguru import logger
 
 from config import Config
-from file_handler import FileHandler
-from image_processor import ImageProcessor
-from pdf_converter import PDFConverter
+from DocKitBot.file_handler import FileHandler
+from DocKitBot.image_processor import ImageProcessor
+from DocKitBot.pdf_converter import PDFConverter
 
 
 class DocumentProcessor:
@@ -132,23 +133,75 @@ class DocumentProcessor:
         try:
             file_ext = file_info['extension']
 
-            # Если это PDF, просто копируем
+            # Если это PDF, конвертируем в изображения для определения ориентации текста
             if file_ext == '.pdf':
-                return file_path
+                try:
+                    # Конвертируем PDF в изображения для анализа ориентации текста
+                    images = await self.pdf_converter.pdf_to_images(file_path)
+                    if not images:
+                        logger.warning(f"Не удалось конвертировать PDF в изображения: {file_path}")
+                        return file_path
+
+                    # Проверяем ориентацию текста каждой страницы
+                    corrected_images = []
+                    needs_correction = False
+
+                    for i, image_path in enumerate(images):
+                        # Определяем правильную ориентацию текста с помощью OCR
+                        corrected_image = await self.image_processor.correct_orientation(image_path)
+                        if corrected_image != image_path:
+                            needs_correction = True
+                            logger.info(f"Страница {i+1} требует исправления ориентации")
+                        corrected_images.append(corrected_image)
+
+                    if needs_correction:
+                        # Объединяем исправленные изображения обратно в PDF
+                        corrected_pdf = await self.pdf_converter.images_to_pdf(
+                            corrected_images,
+                            os.path.splitext(os.path.basename(file_path))[0]
+                        )
+
+                        # Очищаем временные изображения
+                        for img_path in images + corrected_images:
+                            if img_path != file_path and os.path.exists(img_path):
+                                os.remove(img_path)
+
+                        logger.info(f"PDF ориентация текста исправлена: {file_path} -> {corrected_pdf}")
+                        return corrected_pdf
+                    else:
+                        # Очищаем временные изображения
+                        for img_path in images:
+                            if img_path != file_path and os.path.exists(img_path):
+                                os.remove(img_path)
+                        logger.info(f"PDF ориентация текста корректна: {file_path}")
+                        return file_path
+
+                except Exception as e:
+                    logger.error(f"Ошибка обработки ориентации текста PDF {file_path}: {e}")
+                    return file_path
 
             # Если это изображение, обрабатываем
             if file_ext in self.config.SUPPORTED_IMAGE_FORMATS:
-                # Определяем и исправляем ориентацию
-                corrected_image = await self.image_processor.correct_orientation(file_path)
+                try:
+                    # Определяем и исправляем ориентацию с таймаутом
+                    corrected_image = await asyncio.wait_for(
+                        self.image_processor.correct_orientation(file_path),
+                        timeout=self.config.OCR_TIMEOUT
+                    )
 
-                # Конвертируем в PDF
-                pdf_path = await self.pdf_converter.image_to_pdf(corrected_image, file_info['name'])
+                    # Конвертируем в PDF
+                    pdf_path = await self.pdf_converter.image_to_pdf(
+                        corrected_image, file_info['name'])
 
-                # Удаляем временное изображение
-                if corrected_image != file_path:
-                    os.remove(corrected_image)
+                    # Удаляем временное изображение
+                    if corrected_image != file_path:
+                        os.remove(corrected_image)
 
-                return pdf_path
+                    return pdf_path
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Таймаут при обработке изображения {file_path}")
+                    raise Exception("Timed out")
 
             return None
 
@@ -180,9 +233,20 @@ class DocumentProcessor:
 
             for base_name, files_with_pages in file_groups.items():
                 if len(files_with_pages) == 1:
-                    # Одностраничный документ
+                    # Одностраничный документ - обрабатываем ориентацию
+                    file_path = files_with_pages[0][0]
                     logger.info(f"Одностраничный документ: {base_name}")
-                    final_files.append(files_with_pages[0][0])
+
+                    # Обрабатываем ориентацию для одностраничного документа
+                    file_info = {
+                        'name': os.path.basename(file_path),
+                        'extension': os.path.splitext(file_path)[1]
+                    }
+                    processed_file = await self._process_file(file_path, file_info)
+                    if processed_file:
+                        final_files.append(processed_file)
+                    else:
+                        final_files.append(file_path)
                 else:
                     # Многостраничный документ
                     logger.info(
@@ -224,10 +288,13 @@ class DocumentProcessor:
 
         # Ищем паттерны страниц
         for pattern in self.config.PAGE_PATTERNS:
+            logger.info(
+                f"Проверяю паттерн '{pattern}' для '{name_without_ext}'")
             match = re.search(pattern, name_without_ext, re.IGNORECASE)
             if match:
                 # Извлекаем номер страницы
                 page_text = match.group()
+                logger.info(f"Найдено совпадение: '{page_text}'")
                 page_number = re.search(r'\d+', page_text)
                 if page_number:
                     page_num = int(page_number.group())
@@ -237,6 +304,11 @@ class DocumentProcessor:
                     logger.info(
                         f"Найден паттерн '{pattern}': страница {page_num}, базовое имя: '{base_name}'")
                     return base_name, page_num
+                else:
+                    logger.warning(
+                        f"Не удалось извлечь номер страницы из '{page_text}'")
+            else:
+                logger.info(f"Паттерн '{pattern}' не подошел")
 
         # Если страница не найдена
         logger.info(f"Страница не найдена, базовое имя: '{name_without_ext}'")
@@ -248,8 +320,11 @@ class DocumentProcessor:
 
         for i, file_path in enumerate(files, 1):
             file_name = os.path.basename(file_path)
+            # Исправляем кодировку файла для правильного отображения
+            fixed_file_name = self.file_handler._fix_filename_encoding(
+                file_name)
             # Убираем расширение для отображения
-            display_name = os.path.splitext(file_name)[0]
+            display_name = os.path.splitext(fixed_file_name)[0]
             inventory += f"{i}. {display_name}.pdf\n"
 
         return inventory

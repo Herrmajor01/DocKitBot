@@ -2,6 +2,7 @@
 Обработчик изображений для DocKitBot
 """
 
+import asyncio
 import os
 import re
 from typing import Optional
@@ -49,7 +50,7 @@ class ImageProcessor:
 
                 logger.info(
                     f"Ориентация исправлена: {image_path} -> {corrected_path}"
-    f", поворот: {current_orientation}°")
+                    f", поворот: {current_orientation}°")
                 return corrected_path
 
         except Exception as e:
@@ -77,17 +78,30 @@ class ImageProcessor:
                 # Пробуем разные языки для определения ориентации
                 try:
                     custom_config = r'--oem 3 --psm 0 -l rus+eng'
-                    osd = pytesseract.image_to_osd(img, config=custom_config)
+                    osd = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            pytesseract.image_to_osd, img,
+                            config=custom_config),
+                        timeout=self.config.OCR_TIMEOUT
+                    )
                 except Exception:
                     try:
                         custom_config = r'--oem 3 --psm 0 -l eng'
-                        osd = pytesseract.image_to_osd(
-                            img, config=custom_config)
+                        osd = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                pytesseract.image_to_osd, img,
+                                config=custom_config),
+                            timeout=self.config.OCR_TIMEOUT
+                        )
                     except Exception:
                         # Если языковые модели не работают, пробуем без них
                         custom_config = r'--oem 3 --psm 0'
-                        osd = pytesseract.image_to_osd(
-                            img, config=custom_config)
+                        osd = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                pytesseract.image_to_osd, img,
+                                config=custom_config),
+                            timeout=self.config.OCR_TIMEOUT
+                        )
 
                 # Извлекаем угол поворота
                 rotate_match = re.search(r'Rotate: (\d+)', osd)
@@ -129,11 +143,15 @@ class ImageProcessor:
                 try:
                     rotated = img.rotate(angle, expand=True)
 
-                    # Пробуем распознать текст
-                    text = pytesseract.image_to_string(
-                        rotated,
-                        lang='rus',
-                        config='--oem 3 --psm 6'
+                    # Пробуем распознать текст с таймаутом
+                    text = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            pytesseract.image_to_string,
+                            rotated,
+                            lang='rus',
+                            config='--oem 3 --psm 6'
+                        ),
+                        timeout=30  # Короткий таймаут для эвристики
                     )
 
                     # Простая оценка качества распознавания

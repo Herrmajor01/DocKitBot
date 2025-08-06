@@ -2,6 +2,7 @@
 Обработчик файлов для DocKitBot
 """
 
+import asyncio
 import os
 import shutil
 import zipfile
@@ -25,20 +26,43 @@ class FileHandler:
             os.makedirs(user_temp_dir, exist_ok=True)
 
             # Восстанавливаем оригинальное имя файла и исправляем кодировку
-            original_name = self._restore_file_name(document.file_name)
+            file_name = document.file_name or "unknown_file"
+            original_name = self._restore_file_name(file_name)
             # Дополнительно пытаемся исправить кодировку
             original_name = self._fix_filename_encoding(original_name)
 
-            # Скачиваем файл
+            # Скачиваем файл с повторными попытками
             file_path = os.path.join(user_temp_dir, original_name)
             file = await document.get_file()
-            await file.download_to_drive(file_path)
+
+            # Повторяем до 3 раз при сетевых ошибках
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await asyncio.wait_for(
+                        file.download_to_drive(file_path),
+                        timeout=120.0  # Увеличиваем таймаут до 2 минут
+                    )
+                    break  # Успешно скачали
+                except (Exception) as retry_error:
+                    if attempt == max_retries - 1:  # Последняя попытка
+                        raise retry_error
+                    # Логируем попытку и ждем перед повтором
+                    logger.warning(
+                        f"Попытка {attempt + 1} неудачна: {retry_error}. "
+                        f"Повторяем через 2 секунды..."
+                    )
+                    await asyncio.sleep(2)
 
             logger.info(f"Файл скачан: {file_path}")
             return file_path
 
         except Exception as e:
-            logger.error(f"Ошибка скачивания файла: {e}")
+            error_msg = str(e) if e else "Неизвестная ошибка"
+            logger.error(
+                f"Ошибка скачивания файла: {error_msg} "
+                f"(тип: {type(e).__name__})"
+            )
             raise
 
     async def download_photo(self, photo: PhotoSize, user_id: int) -> str:
@@ -52,36 +76,77 @@ class FileHandler:
             file_name = f"photo_{user_id}_{photo.file_id}.jpg"
             file_path = os.path.join(user_temp_dir, file_name)
 
-            # Скачиваем фото
+            # Скачиваем фото с повторными попытками
             file = await photo.get_file()
-            await file.download_to_drive(file_path)
+
+            # Повторяем до 3 раз при сетевых ошибках
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await asyncio.wait_for(
+                        file.download_to_drive(file_path),
+                        timeout=120.0  # Увеличиваем таймаут до 2 минут
+                    )
+                    break  # Успешно скачали
+                except (Exception) as retry_error:
+                    if attempt == max_retries - 1:  # Последняя попытка
+                        raise retry_error
+                    # Логируем попытку и ждем перед повтором
+                    logger.warning(
+                        f"Попытка {attempt + 1} скачивания фото неудачна: "
+                        f"{retry_error}. Повторяем через 2 секунды..."
+                    )
+                    await asyncio.sleep(2)
 
             logger.info(f"Фото скачано: {file_path}")
             return file_path
 
         except Exception as e:
-            logger.error(f"Ошибка скачивания фото: {e}")
+            error_msg = str(e) if e else "Неизвестная ошибка"
+            logger.error(
+                f"Ошибка скачивания фото: {error_msg} "
+                f"(тип: {type(e).__name__})"
+            )
             raise
 
-    def extract_archive(self, archive_path: str, user_id: int) -> List[str]:
+    async def extract_archive(self, archive_path: str, user_id: int,
+                              progress_callback=None) -> List[str]:
         """Распаковывает архив и возвращает список путей к файлам"""
         try:
             extract_dir = os.path.join(
                 self.config.TEMP_DIR, str(user_id), "extracted")
             os.makedirs(extract_dir, exist_ok=True)
             extracted_files = []
+
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
                 file_list = zip_ref.namelist()
+                total_files = len([f for f in file_list
+                                  if not f.endswith('/') and
+                                  not f.startswith('__MACOSX/')])
+                processed_count = 0
+
                 for file_name in file_list:
                     if (file_name.endswith('/') or
-                        file_name.startswith('__MACOSX/')):
+                            file_name.startswith('__MACOSX/')):
                         continue
+
                     file_ext = os.path.splitext(file_name)[1].lower()
-                    if file_ext not in self.config.SUPPORTED_DOCUMENT_FORMATS:
+                    # Поддерживаем и документы, и изображения
+                    supported_formats = (
+                        self.config.SUPPORTED_DOCUMENT_FORMATS +
+                        self.config.SUPPORTED_IMAGE_FORMATS)
+                    if file_ext not in supported_formats:
                         logger.warning(
                             f"Неподдерживаемый формат в архиве: "
                             f"{file_name}")
                         continue
+
+                    # Обновляем прогресс
+                    processed_count += 1
+                    progress = int((processed_count / total_files) * 100)
+                    if progress_callback:
+                        await progress_callback(progress, file_name)
+
                     # Извлекаем файл
                     zip_ref.extract(file_name, extract_dir)
                     extracted_path = os.path.join(extract_dir, file_name)
@@ -105,13 +170,17 @@ class FileHandler:
                                 os.rename(extracted_path, fixed_path)
                                 extracted_path = fixed_path
                             except OSError as e:
-                                logger.warning(
-                                    f"Не удалось переименовать файл "
-                                    f"{extracted_path} -> {fixed_path}: {e}")
-                                # Если переименование не удалось, используем исходный путь
+                                msg = (
+                                    "Не удалось переименовать файл "
+                                    f"{extracted_path} -> {fixed_path}: {e}"
+                                )
+                                logger.warning(msg)
+                                # Если переименование не удалось,
+                                # используем исходный путь
                                 pass
 
                     extracted_files.append(extracted_path)
+
             logger.info(f"Архив распакован: {len(extracted_files)} файлов")
             return extracted_files
         except zipfile.BadZipFile:
@@ -131,7 +200,8 @@ class FileHandler:
             archive_path = os.path.join(
                 output_dir, f"processed_documents_{user_id}.zip")
 
-            with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
+            with zipfile.ZipFile(
+                    archive_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
                 for file_path in files:
                     if os.path.exists(file_path):
                         # Добавляем файл в архив с очищенным именем
@@ -203,7 +273,10 @@ class FileHandler:
             '╨₧', '╤é', '╤ç', '╨╡', '╤â', '╨┐', '╨╛', '╨▓',
             '╨░', '╨╜', '╨╕', '╨╗', '╨╢', '╨▒', '╨┤', '╨╝',
             '╨╣', '╨║', '╨│', '╨╖', '╨╪', '╨Ю', '╨Я', '╨Ъ',
-            '╨Ы', '╨Ь', '╨Э', '╨Ч', '╨Ш', '╨Щ', 'Γäû'
+            '╨Ы', '╨Ь', '╨Э', '╨Ч', '╨Ш', '╨Щ', 'Γäû',
+            # Дополнительные символы кракозябр
+            '╤Ç', '╤ü', '╤ï', '╤à', '╤ì', '╤ë', '╤î', '╤ù',
+            '╤ê', '╤¢', '╤ä', '╤Å', '╨ƒ'
         ]
         return any(char in text for char in mojibake_chars)
 
@@ -281,6 +354,16 @@ class FileHandler:
             '╨₧╤é╤ç╨╡╤é': 'Отчет',
             '╨₧╤é╨▓╨╡╤é': 'Ответ',
             '╨₧╤é╨▓╨╡╤é╤ç': 'Ответ',
+            '╨í╤ç╨╡╤é': 'Счет',
+            '╨í': 'С',
+            '╤å': 'ц',
+            '╨ƒ╨╛╤ç╤é╨╛╨▓╨░╤Å': 'Почтовая',
+            '╨║╨▓╨╕╤é╨░╨╜╤å╨╕╤Å': 'квитанция',
+            '╨ƒ╨╗╨░╤é╨╡╨╢╨╜╨╛╨╡ ╨┐╨╛╤ç╨╡╨╜╨╕╨╡': 'Платежное поручение',
+            '╨┐╨╛╤ç╨╡╨╜╨╕╨╡': 'поручение',
+            '╨ó╨╛╨▓╨░╤Ç╨╜╨╛-╤é╤Ç╨░╨╜╤ü╨┐╨╛╤Ç╤é╨╜╨░╤Å': 'Товарно-транспортная',
+            '╨ó╨╛╨▓╨░╤Ç╨╜╨╛': 'Товарно',
+            '╨ó': 'Т',
             '╨╛╨▒': 'об',
             'отс╨╗╨╡╨╢╨╕╨▓╨░╨╜╨╕╨╕': 'отслеживании',
             '╨┐╨╛╤ç╤é╨╛╨▓╨╛г╨╛': 'почтового',
@@ -323,11 +406,30 @@ class FileHandler:
             # Дополнительные замены для конкретных кракозябр из логов
             '╨¥': 'Н',
             '╤Å': 'я',
+            # Дополнительные замены для 'Платежное поручение'
+            '╨ƒ╨╗╨░╤é╨╡╨╢╨╜╨╛╨╡ ╨┐╨╛╤Ç╤â╤ç╨╡╨╜╨╕╨╡': 'Платежное поручение',
+            '╨ƒ╨╗╨░╤é╨╡╨╢╨╜╨╛╨╡': 'Платежное',
+            '╨┐╨╛╤Ç╤â╤ç╨╡╨╜╨╕╨╡': 'поручение',
+            '╤Ç': 'р',
+            '╤ü': 'с',
+            '╤ï': 'ф',
+            '╤à': 'х',
+            '╤ì': 'ц',
+            '╤ë': 'щ',
+            '╤î': 'ъ',
+            '╤ù': 'ы',
+            '╤ç': 'ч',
+            '╤ê': 'ш',
+            '╤ë': 'щ',
+            '╤¢': 'ь',
+            '╤ì': 'ц',
+            '╤ä': 'ю',
+            '╤Å': 'я',
         }
 
-        fixed_name=file_name
+        fixed_name = file_name
         for wrong, correct in replacements.items():
-            fixed_name=fixed_name.replace(wrong, correct)
+            fixed_name = fixed_name.replace(wrong, correct)
 
         # Если были замены, логируем
         if fixed_name != file_name:
@@ -336,55 +438,56 @@ class FileHandler:
         return fixed_name
 
     def _restore_file_name(self, file_name: str) -> str:
-        """Восстанавливает оригинальное имя файла, заменяя подчеркивания на пробелы"""
+        """Восстанавливает оригинальное имя файла,
+        заменяя подчеркивания на пробелы"""
         # Заменяем подчеркивания на пробелы, но сохраняем расширение
-        name, ext=os.path.splitext(file_name)
-        restored_name=name.replace('_', ' ')
+        name, ext = os.path.splitext(file_name)
+        restored_name = name.replace('_', ' ')
 
         # Восстанавливаем даты (заменяем пробелы на точки в датах)
         import re
 
         # Паттерн для дат вида "DD MM YYYY" или "DD MM YYYY г"
-        date_pattern=r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})(\s+г)?'
+        date_pattern = r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})(\s+г)?'
 
         def replace_date(match):
-            day, month, year, g=match.groups()
-            result=f"{day}.{month}.{year}"
+            day, month, year, g = match.groups()
+            result = f"{day}.{month}.{year}"
             if g:
                 result += " г."
             return result
 
-        restored_name=re.sub(date_pattern, replace_date, restored_name)
+        restored_name = re.sub(date_pattern, replace_date, restored_name)
 
         # Восстанавливаем некоторые специальные символы
-        restored_name=restored_name.replace('№', '№')  # Номер
-        restored_name=restored_name.replace(
+        restored_name = restored_name.replace('№', '№')  # Номер
+        restored_name = restored_name.replace(
             ' от ', ' от ')  # Нормализуем пробелы вокруг "от"
 
         # Убираем лишние пробелы и символы в конце
-        restored_name=' '.join(restored_name.split())
+        restored_name = ' '.join(restored_name.split())
 
         # Убираем лишние символы в конце имени (точки, пробелы, подчеркивания)
-        restored_name=restored_name.rstrip(' ._-')
+        restored_name = restored_name.rstrip(' ._-')
 
         return restored_name + ext
 
     def _clean_final_filename(self, file_name: str) -> str:
         """Очищает финальное имя файла от лишних символов"""
         # Убираем расширение
-        name, ext=os.path.splitext(file_name)
+        name, ext = os.path.splitext(file_name)
 
         # Убираем лишние символы в конце имени
-        clean_name=name.rstrip(' ._-')
+        clean_name = name.rstrip(' ._-')
 
         # Убираем лишние пробелы
-        clean_name=' '.join(clean_name.split())
+        clean_name = ' '.join(clean_name.split())
 
         return clean_name + ext
 
     def validate_file_name(self, file_name: str) -> Dict[str, Any]:
         """Проверяет корректность имени файла"""
-        result={
+        result = {
             'valid': True,
             'warnings': [],
             'suggestions': []
@@ -392,7 +495,7 @@ class FileHandler:
 
         # Проверяем длину имени
         if len(file_name) > 200:
-            result['valid']=False
+            result['valid'] = False
             result['warnings'].append("Имя файла слишком длинное")
 
         # Проверяем наличие расширения
@@ -400,17 +503,17 @@ class FileHandler:
             result['warnings'].append("Файл без расширения")
 
         # Проверяем специальные символы
-        invalid_chars=['<', '>', ':', '"', '|', '?', '*']
+        invalid_chars = ['<', '>', ':', '"', '|', '?', '*']
         for char in invalid_chars:
             if char in file_name:
                 result['warnings'].append(
                     f"Содержит недопустимый символ: {char}")
 
         # Проверяем осмысленность имени
-        meaningful_words=['договор', 'заявка',
+        meaningful_words = ['договор', 'заявка',
                             'накладная', 'квитанция', 'счет', 'акт']
-        file_lower=file_name.lower()
-        has_meaningful=any(word in file_lower for word in meaningful_words)
+        file_lower = file_name.lower()
+        has_meaningful = any(word in file_lower for word in meaningful_words)
 
         if not has_meaningful:
             result['suggestions'].append(
